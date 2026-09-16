@@ -114,6 +114,69 @@ pub async fn create_space(
     ))
 }
 
+/// `GET /spaces/{id}/nodes/{node_id}/changes`：文档操作记录。
+pub async fn list_node_changes(
+    State(state): State<SharedState>,
+    auth: AuthUser,
+    Path((space_id, node_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<Vec<club_bus::audit::ChangeEntry>>, AppError> {
+    let user_id = user_id_of(&auth)?;
+    repo::ensure_member(&state.db, space_id, user_id).await?;
+    load_node(&state, space_id, node_id).await?;
+    let items = club_bus::audit::list_for(&state.db, "doc_node", &node_id.to_string(), 50)
+        .await
+        .map_err(AppError::internal)?;
+    Ok(Json(items))
+}
+
+/// `POST /changes/{id}/undo`：撤销一次正文变更（以新版本写回旧内容）。
+pub async fn undo_change(
+    State(state): State<SharedState>,
+    auth: AuthUser,
+    Path(change_id): Path<Uuid>,
+) -> Result<Json<Value>, AppError> {
+    let user_id = user_id_of(&auth)?;
+    let entry = club_bus::audit::find(&state.db, change_id)
+        .await
+        .map_err(AppError::internal)?
+        .ok_or_else(|| AppError::not_found("DOC_CHANGE_NOT_FOUND", "变更记录不存在"))?;
+    if entry.entity != "doc_node" {
+        return Err(AppError::unprocessable(
+            "DOC_UNDO_UNSUPPORTED",
+            "仅支持撤销文档正文变更",
+            vec![],
+        ));
+    }
+    let before = entry.before.clone().ok_or_else(|| {
+        AppError::unprocessable("DOC_UNDO_UNSUPPORTED", "该记录不可撤销", vec![])
+    })?;
+    let node_id: Uuid = entry.entity_id.parse().map_err(AppError::internal)?;
+    let model = repo::find_node(&state.db, node_id)
+        .await?
+        .ok_or_else(|| AppError::not_found("DOC_NODE_NOT_FOUND", "节点不存在"))?;
+    repo::ensure_editor(&state.db, model.space_id, user_id).await?;
+    let content = before
+        .get("contentMd")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let now = state.now();
+    let updated = repo::update_content(&state.db, &model, model.version, content, user_id, now).await?;
+    let _ = club_bus::audit::record(
+        &state.db,
+        "doc_node",
+        &updated.id.to_string(),
+        "undo",
+        Some(json!({ "contentMd": model.content_md, "version": model.version })),
+        Some(json!({ "contentMd": updated.content_md, "version": updated.version })),
+        Some(user_id),
+        now,
+    )
+    .await;
+    Ok(Json(
+        json!({ "version": updated.version, "updatedAt": updated.updated_at }),
+    ))
+}
+
 /// `DELETE /spaces/{id}`：删除知识库（仅空间管理员）。
 pub async fn delete_space(
     State(state): State<SharedState>,
@@ -300,6 +363,17 @@ pub async fn update_content(
         state.now(),
     )
     .await?;
+    let _ = club_bus::audit::record(
+        &state.db,
+        "doc_node",
+        &updated.id.to_string(),
+        "update",
+        Some(json!({ "contentMd": model.content_md, "version": model.version })),
+        Some(json!({ "contentMd": updated.content_md, "version": updated.version })),
+        Some(user_id),
+        state.now(),
+    )
+    .await;
     Ok(Json(
         json!({ "version": updated.version, "updatedAt": updated.updated_at }),
     ))
@@ -361,6 +435,11 @@ pub fn router() -> Router<SharedState> {
             "/spaces/{id}/nodes/{node_id}/content",
             axum::routing::put(update_content),
         )
+        .route(
+            "/spaces/{id}/nodes/{node_id}/changes",
+            get(list_node_changes),
+        )
+        .route("/changes/{id}/undo", post(undo_change))
         .route("/spaces/{id}/nodes/{node_id}/versions", get(list_versions))
         .route(
             "/spaces/{id}/nodes/{node_id}/versions/{version}/restore",

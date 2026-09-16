@@ -162,6 +162,7 @@ pub mod state {
 
 pub mod entity;
 pub mod migration;
+pub mod migration2;
 pub mod repo;
 /// HTTP 路由。
 pub mod routes;
