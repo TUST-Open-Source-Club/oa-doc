@@ -81,6 +81,40 @@ pub async fn ensure_member(
         .ok_or_else(|| AppError::forbidden("DOC_NOT_MEMBER", "无权访问该空间"))
 }
 
+/// 删除空间：级联清理版本、节点与成员关系。
+pub async fn delete_space(db: &DatabaseConnection, space_id: Uuid) -> Result<(), AppError> {
+    let node_ids: Vec<Uuid> = node::Entity::find()
+        .filter(node::Column::SpaceId.eq(space_id))
+        .all(db)
+        .await
+        .map_err(map_db_err)?
+        .into_iter()
+        .map(|row| row.id)
+        .collect();
+    if !node_ids.is_empty() {
+        version::Entity::delete_many()
+            .filter(version::Column::NodeId.is_in(node_ids.clone()))
+            .exec(db)
+            .await
+            .map_err(map_db_err)?;
+        node::Entity::delete_many()
+            .filter(node::Column::Id.is_in(node_ids))
+            .exec(db)
+            .await
+            .map_err(map_db_err)?;
+    }
+    space_member::Entity::delete_many()
+        .filter(space_member::Column::SpaceId.eq(space_id))
+        .exec(db)
+        .await
+        .map_err(map_db_err)?;
+    space::Entity::delete_by_id(space_id)
+        .exec(db)
+        .await
+        .map_err(map_db_err)?;
+    Ok(())
+}
+
 /// 校验可编辑（admin/editor）。
 pub async fn ensure_editor(
     db: &DatabaseConnection,

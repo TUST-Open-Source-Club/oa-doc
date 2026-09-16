@@ -114,6 +114,24 @@ pub async fn create_space(
     ))
 }
 
+/// `DELETE /spaces/{id}`：删除知识库（仅空间管理员）。
+pub async fn delete_space(
+    State(state): State<SharedState>,
+    auth: AuthUser,
+    Path(space_id): Path<Uuid>,
+) -> Result<StatusCode, AppError> {
+    let user_id = user_id_of(&auth)?;
+    let member = repo::ensure_member(&state.db, space_id, user_id).await?;
+    if member.role != "admin" {
+        return Err(AppError::forbidden(
+            "DOC_FORBIDDEN",
+            "仅空间管理员可删除知识库",
+        ));
+    }
+    repo::delete_space(&state.db, space_id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// `GET /spaces`。
 pub async fn list_spaces(
     State(state): State<SharedState>,
@@ -335,6 +353,7 @@ pub async fn restore_version(
 pub fn router() -> Router<SharedState> {
     Router::new()
         .route("/spaces", get(list_spaces).post(create_space))
+        .route("/spaces/{id}", axum::routing::delete(delete_space))
         .route("/spaces/{id}/tree", get(space_tree))
         .route("/spaces/{id}/nodes", post(create_node))
         .route("/spaces/{id}/nodes/{node_id}", get(get_node))
